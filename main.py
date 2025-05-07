@@ -4,9 +4,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementNotInteractableException, \
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException, \
     StaleElementReferenceException
-from selenium.webdriver.common.keys import Keys
 import time
 import pandas as pd
 import re
@@ -16,8 +15,12 @@ STARTING_URL = "https://2gis.kz/astana/search/Рестораны/rubricId/164"
 RESTAURANT_CARD_SELECTOR = "div._1kf6gff"
 NAME_SELECTOR = "span._lvwrwt"
 ADDRESS_SELECTOR = "div._klarpw"
-
 SCROLLABLE_ELEMENT_SELECTOR = "div._1rkbbi0x[data-scroll='true']"
+
+# Pagination Selectors
+NEXT_PAGE_BUTTON_ACTIVE_SELECTOR = "div._n5hmn94:nth-child(2)"  # The clickable "Next" arrow's container
+# Class that the "Next Page" button's container gets when it's disabled (becomes the right-most greyed out arrow)
+NEXT_PAGE_BUTTON_DISABLED_CLASS_CHECK = "_7q94tr"
 
 
 # --- End of Selectors ---
@@ -36,9 +39,7 @@ def clean_text(text):
 
 def attempt_to_close_cookie_banner(driver):
     cookie_banner_selectors = [
-        "button._1x5s6kk",
-        "div._n1367pl button",
-        "div[data-qa-id='gdpr-banner-button-agree']"
+        "button._1x5s6kk", "div._n1367pl button", "div[data-qa-id='gdpr-banner-button-agree']"
     ]
     for i, selector in enumerate(cookie_banner_selectors):
         try:
@@ -58,36 +59,38 @@ def attempt_to_close_cookie_banner(driver):
     return False
 
 
-def scroll_page_fully(driver):
-    print("  Attempting to scroll the main page fully to ensure all elements are potentially triggered...")
-    body_element = driver.find_element(By.TAG_NAME, 'body')
-    last_page_height = driver.execute_script("return document.body.scrollHeight")
+def scroll_list_fully(driver, list_container_selector):
+    print("  Attempting to scroll the list container fully...")
+    try:
+        list_container = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, list_container_selector))
+        )
+        last_scroll_top = -1
+        current_scroll_top = driver.execute_script("return arguments[0].scrollTop", list_container)
+        scroll_attempts = 0
+        while scroll_attempts < 20:
+            driver.execute_script("arguments[0].scrollTop += arguments[0].clientHeight;", list_container)
+            time.sleep(0.7)
+            last_scroll_top = current_scroll_top
+            current_scroll_top = driver.execute_script("return arguments[0].scrollTop", list_container)
+            print(
+                f"    Scrolled list. Old scrollTop: {last_scroll_top}, New scrollTop: {current_scroll_top}, Attempt: {scroll_attempts + 1}")
+            if current_scroll_top == last_scroll_top:
+                driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", list_container)
+                time.sleep(1)
+                current_scroll_top = driver.execute_script("return arguments[0].scrollTop", list_container)
+                if current_scroll_top == last_scroll_top:
+                    print("    List scroll position no longer changing. Assuming end of current page's list.")
+                    break
+            scroll_attempts += 1
+        print("  Finished scrolling list attempts for this page.")
+    except TimeoutException:
+        print(f"  Scrollable list container '{list_container_selector}' not found in time.")
+    except Exception as e:
+        print(f"  Error during list scrolling: {e}")
 
-    scroll_attempts = 0
-    while scroll_attempts < 15:  # Limit attempts to prevent infinite loops
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(1.5)  # Wait for content to load
-        new_page_height = driver.execute_script("return document.body.scrollHeight")
-        print(
-            f"    Scrolled main page. Old height: {last_page_height}, New height: {new_page_height}, Attempt: {scroll_attempts + 1}")
-        if new_page_height == last_page_height:
-            # Try a few more times just in case
-            no_change_scrolls = 0
-            while no_change_scrolls < 2 and new_page_height == last_page_height:
-                time.sleep(1.5)
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                new_page_height = driver.execute_script("return document.body.scrollHeight")
-                if new_page_height != last_page_height: break
-                no_change_scrolls += 1
-            if new_page_height == last_page_height:
-                print("    Main page scroll height no longer changing.")
-                break
-        last_page_height = new_page_height
-        scroll_attempts += 1
-    print("  Finished main page scrolling attempts.")
 
-
-def scrape_restaurants_astana():
+def scrape_restaurants_astana_all_pages():
     options = webdriver.ChromeOptions()
     options.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36")
@@ -102,6 +105,7 @@ def scrape_restaurants_astana():
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
     all_restaurants_data = []
+    processed_restaurant_links = set()  # To avoid duplicates if an item appears on multiple pages during load
 
     print(f"Navigating to: {STARTING_URL}")
     driver.get(STARTING_URL)
@@ -110,85 +114,135 @@ def scrape_restaurants_astana():
     attempt_to_close_cookie_banner(driver)
     time.sleep(5)
 
-    # --- SCROLL THE ENTIRE PAGE FIRST ---
-    scroll_page_fully(driver)
-    # --- THEN GET ALL CARD CONTAINERS ---
+    page_num = 1
+    while True:
+        print(f"\n--- Scraping Page {page_num} ---")
 
-    print(f"\n--- Finding restaurant card containers after scrolling ---")
-
-    try:
-        # Wait for at least one card to be present
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, RESTAURANT_CARD_SELECTOR))
-        )
-        print("At least one restaurant card container detected.")
-    except TimeoutException:
-        print(f"No restaurant card containers found after scrolling. Exiting.")
-        driver.quit()
-        return all_restaurants_data
-
-    restaurant_cards = driver.find_elements(By.CSS_SELECTOR, RESTAURANT_CARD_SELECTOR)
-
-    if not restaurant_cards:
-        print(f"No company cards found with selector '{RESTAURANT_CARD_SELECTOR}' after scrolling.")
-        driver.quit()
-        return all_restaurants_data
-
-    print(f"Found {len(restaurant_cards)} restaurant card containers.")
-
-    for card_index, card_container in enumerate(restaurant_cards):
-        restaurant_data = {}
-        print(f"  Processing card {card_index + 1}/{len(restaurant_cards)}...")
-
-        name_text_raw = None
-        address_text_raw = None
+        scroll_list_fully(driver, SCROLLABLE_ELEMENT_SELECTOR)
 
         try:
-            # Scroll the current card container into view (center)
-            # This is important for elements that might lazy-load their content
-            driver.execute_script("arguments[0].scrollIntoView({behavior: 'auto', block: 'center'});", card_container)
-            time.sleep(0.7)  # Increased wait after scrolling card into view
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, RESTAURANT_CARD_SELECTOR))
+            )
+        except TimeoutException:
+            print(f"No restaurant card containers found on page {page_num} after scrolling. Assuming end or error.")
+            break
 
-            # Name
+        restaurant_cards = driver.find_elements(By.CSS_SELECTOR, RESTAURANT_CARD_SELECTOR)
+        if not restaurant_cards:
+            print(f"No company cards found on page {page_num} even after scroll. Ending.")
+            break
+
+        print(f"Found {len(restaurant_cards)} restaurant card containers on page {page_num}.")
+
+        new_items_on_page = 0
+        for card_index, card_container in enumerate(restaurant_cards):
+            restaurant_data = {'name': None, 'address': None}  # Initialize with None
+            print(f"  Processing card {card_index + 1}/{len(restaurant_cards)}...")
+
+            name_text_raw = None
+            address_text_raw = None
+            item_link = None
+
             try:
-                # Wait for the name element to be VISIBLE within this specific card
-                name_element = WebDriverWait(card_container, 7).until(  # Increased wait to 7s
-                    EC.visibility_of_element_located((By.CSS_SELECTOR, NAME_SELECTOR))
-                )
-                full_name_text = name_element.text.strip()
-                if full_name_text:
-                    name_text_raw = full_name_text.split('\n')[0].strip()
-            except TimeoutException:
-                print(f"    - Name ('{NAME_SELECTOR}') timed out or not visible for card {card_index + 1}")
-            except NoSuchElementException:
-                print(f"    - Name ('{NAME_SELECTOR}') not found for card {card_index + 1}")
+                # Try to get a unique link for the item to avoid duplicates
+                try:
+                    link_element = card_container.find_element(By.CSS_SELECTOR, "a._1rehek")  # Common link selector
+                    item_link = link_element.get_attribute('href')
+                    if item_link in processed_restaurant_links:
+                        print(f"    Skipping duplicate item: {item_link}")
+                        continue
+                except NoSuchElementException:
+                    pass  # No unique link found, will rely on name/address combo
 
-            # Address
-            try:
-                # Wait for the address block to be VISIBLE within this specific card
-                address_element = WebDriverWait(card_container, 7).until(  # Increased wait to 7s
-                    EC.visibility_of_element_located((By.CSS_SELECTOR, ADDRESS_SELECTOR))
-                )
-                address_text_raw = address_element.text.strip()
-            except TimeoutException:
-                print(f"    - Address ('{ADDRESS_SELECTOR}') timed out or not visible for card {card_index + 1}")
-            except NoSuchElementException:
-                print(f"    - Address ('{ADDRESS_SELECTOR}') not found for card {card_index + 1}")
+                driver.execute_script("arguments[0].scrollIntoView({behavior: 'auto', block: 'center'});",
+                                      card_container)
+                time.sleep(0.6)  # Wait for card to settle after scroll
 
-            restaurant_data['name'] = clean_text(name_text_raw)
-            restaurant_data['address'] = clean_text(address_text_raw)
+                try:
+                    name_element = WebDriverWait(card_container, 7).until(
+                        EC.visibility_of_element_located((By.CSS_SELECTOR, NAME_SELECTOR))
+                    )
+                    full_name_text = name_element.text.strip()
+                    if full_name_text:
+                        name_text_raw = full_name_text.split('\n')[0].strip()
+                except TimeoutException:
+                    print(f"    - Name ('{NAME_SELECTOR}') timed out or not visible for card {card_index + 1}")
+                except NoSuchElementException:
+                    print(f"    - Name ('{NAME_SELECTOR}') not found for card {card_index + 1}")
 
-            if restaurant_data.get('name') and restaurant_data.get('address'):  # Require both for a "good" entry
-                print(f"    + Collected: {restaurant_data}")
-                all_restaurants_data.append(restaurant_data)
-            else:
-                print(
-                    f"    - Card {card_index + 1} skipped (missing name or address). Raw name: '{name_text_raw}', Raw address: '{address_text_raw}'")
+                try:
+                    address_element = WebDriverWait(card_container, 7).until(
+                        EC.visibility_of_element_located((By.CSS_SELECTOR, ADDRESS_SELECTOR))
+                    )
+                    address_text_raw = address_element.text.strip()
+                except TimeoutException:
+                    print(f"    - Address ('{ADDRESS_SELECTOR}') timed out or not visible for card {card_index + 1}")
+                except NoSuchElementException:
+                    print(f"    - Address ('{ADDRESS_SELECTOR}') not found for card {card_index + 1}")
 
-        except StaleElementReferenceException:
-            print(f"    StaleElementReferenceException for card {card_index + 1}. Skipping this card.")
-        except Exception as e:
-            print(f"    Error parsing card {card_index + 1}: {type(e).__name__} - {e}")
+                restaurant_data['name'] = clean_text(name_text_raw)
+                restaurant_data['address'] = clean_text(address_text_raw)
+
+                if restaurant_data.get('name') and restaurant_data.get('address'):
+                    print(f"    + Collected: {restaurant_data}")
+                    all_restaurants_data.append(restaurant_data)
+                    if item_link:
+                        processed_restaurant_links.add(item_link)
+                    new_items_on_page += 1
+                else:
+                    print(
+                        f"    - Card {card_index + 1} skipped (missing name or address). Raw name: '{name_text_raw}', Raw address: '{address_text_raw}'")
+
+            except StaleElementReferenceException:
+                print(f"    StaleElementReferenceException for card {card_index + 1}. Skipping.")
+            except Exception as e:
+                print(f"    Error parsing card {card_index + 1}: {type(e).__name__} - {e}")
+
+        if new_items_on_page == 0 and page_num > 1:  # If no new items were added on this page (and it's not the first)
+            print("No new items found on this page, likely end of unique results.")
+            # break # Optional: break if no new items for a while
+
+        # --- Pagination Logic ---
+        try:
+            print("  Looking for 'Next Page' button...")
+            # Check if the "Next Page" button is in its disabled state first
+            # The disabled button might have the class _7q94tr and be the last div in its container
+            # The active "Next Page" button is NEXT_PAGE_BUTTON_ACTIVE_SELECTOR
+
+            # Find the container for pagination controls
+            pagination_controls = driver.find_elements(By.CSS_SELECTOR,
+                                                       "div._5ocwns > div")  # _5ocwns is the parent of _7q94tr and _n5hmn94
+            if not pagination_controls:
+                print("  Pagination controls container not found. Assuming end.")
+                break
+
+            last_pagination_control = pagination_controls[-1]  # Get the last element in pagination controls
+
+            if NEXT_PAGE_BUTTON_DISABLED_CLASS_CHECK in last_pagination_control.get_attribute("class"):
+                print("  'Next Page' button is in disabled state (has class '_7q94tr'). Reached end of pages.")
+                break
+
+            # If not disabled, try to find the active next button
+            next_button = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, NEXT_PAGE_BUTTON_ACTIVE_SELECTOR))
+            )
+            driver.execute_script("arguments[0].scrollIntoView(true);", next_button)
+            time.sleep(0.5)
+            driver.execute_script("arguments[0].click();", next_button)
+            print(f"  Clicked 'Next Page'. Waiting for page {page_num + 1} to load...")
+            page_num += 1
+            time.sleep(7)  # Crucial: wait for the next page to load content
+
+        except TimeoutException:
+            print("  'Next Page' button not clickable or timed out. Assuming end of results.")
+            break
+        except NoSuchElementException:
+            print("  'Next Page' button (active or disabled check) not found. Assuming end of results.")
+            break
+        except Exception as e_page:
+            print(f"  Error during pagination: {type(e_page).__name__} - {e_page}. Assuming end of results.")
+            break
 
     driver.quit()
     print(f"\nFinished scraping. Total items collected: {len(all_restaurants_data)}")
@@ -196,8 +250,8 @@ def scrape_restaurants_astana():
 
 
 if __name__ == "__main__":
-    print("Starting 2GIS restaurant scraper for Astana (Attempting to scroll and get all on first page load)...")
-    scraped_data = scrape_restaurants_astana()
+    print("Starting 2GIS restaurant scraper for Astana (All Pages)...")
+    scraped_data = scrape_restaurants_astana_all_pages()
 
     if scraped_data:
         df = pd.DataFrame(scraped_data)
@@ -207,7 +261,7 @@ if __name__ == "__main__":
                 df[col] = None
         df = df[expected_columns]
 
-        df.to_csv("2gis_astana_restaurants_scrolled.csv", index=False, encoding='utf-8-sig')
-        print(f"\nSuccessfully scraped {len(df)} restaurants and saved to 2gis_astana_restaurants_scrolled.csv")
+        df.to_csv("2gis_astana_restaurants_all_pages.csv", index=False, encoding='utf-8-sig')
+        print(f"\nSuccessfully scraped {len(df)} restaurants and saved to 2gis_astana_restaurants_all_pages.csv")
     else:
         print("\nNo data was scraped.")
